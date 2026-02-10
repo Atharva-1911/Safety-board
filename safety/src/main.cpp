@@ -11,8 +11,7 @@
 void setup(void);
 void loop(void);
 void pcf8575_writeAll(uint16_t);
-void engage_relay_state(uint16_t);
-void disengage_relay_state(uint16_t);
+
 
 // ISR handlers
 void IRAM_ATTR estop_isr();
@@ -88,15 +87,6 @@ const uint8_t LIMIT_SWITCH_PINS[NUM_LIMIT_SWITCHES] = {14, 27, 26, 25, 33, 32};
 )
 
 // Gripper relay stays HIGH (released) to prevent dropping held objects
-
-const uint16_t LIMIT_SWITCH_RELAY_MASKS[NUM_LIMIT_SWITCHES] = {
-    J0_BRAKE_RELAY ,    // Limit 0 → J0 brake ON, driver OFF
-    J1_BRAKE_RELAY ,    // Limit 1 → J1 brake ON, driver OFF
-    J2_BRAKE_RELAY ,    // Limit 2 → J2 brake ON, driver OFF,
-    0xFFFF,
-    0xFFFF,
-    0xFFFF
-};
 
 //global variables
 
@@ -362,18 +352,9 @@ uint16_t check_limit_switches() {
     // COMPOSE RELAY MASK: Start with 0xFFFF (all relays off)
     // AND with each active switch's mask to engage its relays
     // If multiple switches hit, AND them all together to engage all needed brakes
-    //uint16_t result = 0xFFFF;
-    //for (uint8_t i = 0; i < NUM_LIMIT_SWITCHES; i++) {
-        //if (current_limit_state & (1 << i)) {
-        //    result &= LIMIT_SWITCH_RELAY_MASKS[i];
-        //}
-    //}
-
+    
     // Return 1 if ANY limit switch is active
 return (current_limit_state != 0);
-
-Serial.print("LIMIT STATE = ");
-Serial.println(limit_stable_state, BIN);
 
 }
 
@@ -526,17 +507,13 @@ void loop() {
     // Get relay states from safety monitoring functions
     // 0xFFFF = all relays OFF (safe, no faults)
     // Specific mask = engage relays for that fault (bits=0 where engaged)
-    //uint16_t estop_relays = check_estop_state();
-    //uint16_t limit_relays = check_limit_switches();
+    
 
     // Compose with AND (active-low: engage if EITHER has 0 bits)
     // If E-Stop pressed: estop_relays has multiple 0 bits → engages those relays
     // If Limit hit: limit_relays has 0 bits for that joint → engages those relays
     // AND combines them: 0 bits from either source engage relays
-    //uint16_t relay_state = estop_relays & limit_relays;
-    //bool estop_pressed = check_estop_state();
-    //bool limit_hit     = check_limit_switches();
-
+    
     // Highest-priority safety decision
    bool estop = check_estop_state();
    uint16_t relay_state;
@@ -555,22 +532,17 @@ void loop() {
         relay_state &= ALL_DRIVERS_MASK;   // force OFF
         relay_state &= J0_BRAKE_RELAY;
     }
-    else if (limit_stable_state & (1 << 1)) {
+    if (limit_stable_state & (1 << 1)) {
         relay_state &= ALL_DRIVERS_MASK;
         relay_state &= J1_BRAKE_RELAY;
     }
-    else if (limit_stable_state & (1 << 2)) {
+    if (limit_stable_state & (1 << 2)) {
         relay_state &= ALL_DRIVERS_MASK;
         relay_state &= J2_BRAKE_RELAY;
     }
 
     taskEXIT_CRITICAL(&limit_state_spinlock);
 }
-
-
-   
-
-
 
     //gripper priority
     relay_state = apply_gripper(relay_state);
@@ -600,12 +572,3 @@ void loop() {
     delayMicroseconds(100);
 }
 
-
-void engage_relay_state(uint16_t relay_state_)
-{
-    pcf8575_writeAll(relay_state_);
-}
-
-void disengage_relay_state(uint16_t relay_state_){
-    pcf8575_writeAll(relay_state_ | ~relay_state_);
-}
