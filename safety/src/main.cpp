@@ -40,13 +40,18 @@ uint16_t check_limit_switches();
 #define TXD2 17
 #define RTS  18
 
-#define LIMIT_SWITCH_0 14
-
+#define LIMIT_J0_PIN 14
+#define LIMIT_J1_PIN 27
+#define LIMIT_J2_PIN 26
+#define LIMIT_J3_PIN 25
+#define LIMIT_J4_PIN 33
+#define LIMIT_J5_PIN 32
 const uint8_t LIMIT_SWITCH_PINS[NUM_LIMIT_SWITCHES] = {14, 27, 26, 25, 33, 32};
 
 
 // system configuration
 #define PCF8575_ADDR 0x20
+#define REG_ADDR 0x0000
 
 // convinience constants: Relay masks
 #define J0_BRAKE_RELAY 0xEFFF
@@ -68,23 +73,18 @@ const uint8_t LIMIT_SWITCH_PINS[NUM_LIMIT_SWITCHES] = {14, 27, 26, 25, 33, 32};
 
 // Safety event relay masks
 // === GROUP MASKS ===
-
-// All brake relays ON
-#define ALL_BRAKES_MASK ( \
-    J0_BRAKE_RELAY & \
-    J1_BRAKE_RELAY & \
-    J2_BRAKE_RELAY \
-)
-
-// All driver relays ON
-#define ALL_DRIVERS_MASK ( \
-    J0_DRIVER_RELAY & \
-    J1_DRIVER_RELAY & \
-    J2_DRIVER_RELAY & \
-    J3_DRIVER_RELAY & \
-    J4_DRIVER_RELAY & \
-    J5_DRIVER_RELAY  \
-)
+// ALL MASKS 
+const uint16_t STARTUP_MASK =(
+    J0_DRIVER_RELAY &
+    J1_DRIVER_RELAY &
+    J2_DRIVER_RELAY &
+    J3_DRIVER_RELAY &
+    J4_DRIVER_RELAY &
+    J5_DRIVER_RELAY &
+    J0_BRAKE_RELAY  &
+    J1_BRAKE_RELAY  &
+    J2_BRAKE_RELAY
+);
 
 // Gripper relay stays HIGH (released) to prevent dropping held objects
 
@@ -93,8 +93,8 @@ const uint8_t LIMIT_SWITCH_PINS[NUM_LIMIT_SWITCHES] = {14, 27, 26, 25, 33, 32};
 // Modbus RTU server (ESP32 acts as slave)
 ModbusServerRTU mb(2000, RTS);   // 2s timeout, RTS pin for RS485 direction
 
-volatile uint16_t modbus_relay_value = 0xFFFF;  // default: all relays OFF
-
+volatile uint16_t modbus_value ;  
+volatile uint16_t relay_state;
 
 // ISR flags (volatile, set by ISRs)
 volatile bool estop_flag_changed = false;
@@ -306,55 +306,7 @@ uint16_t check_estop_state() {
     // Pressed: all relays off
     // Released: engage brakes+drivers (except gripper)
     // Return ONLY the E-STOP state, no relay decisions here
-    return last_estop_stable_state ? 0x0001 : 0x0000;
-
-}
-
-/**
- * Check all limit switches and return composed relay mask
- *
- * Debounce tasks have already filtered state and updated limit_stable_state.
- * This function detects edges (state changes) and composes the relay mask.
- *
- * Returns:
- *   0xFFFF - All limits clear, all relays OFF (safe)
- *   Composed mask - One or more limits hit, engage corresponding relays
- */
-uint16_t check_limit_switches() {
-    // Acquire spinlock to read stable state safely (debounce tasks might be updating it)
-    taskENTER_CRITICAL(&limit_state_spinlock);
-    uint8_t current_limit_state = limit_stable_state;
-    taskEXIT_CRITICAL(&limit_state_spinlock);
-
-    // EDGE DETECTION: Debounce tasks updated limit_stable_state
-    // We only log if the state actually changed
-    if (current_limit_state != last_limit_stable_state) {
-        Serial.print("LIMIT SWITCHES: 0b");
-        Serial.print(current_limit_state, BIN);
-        Serial.print(" (");
-
-        // Log which switches are active
-        bool first = true;
-        for (uint8_t i = 0; i < NUM_LIMIT_SWITCHES; i++) {
-            if (current_limit_state & (1 << i)) {
-                if (!first) Serial.print(", ");
-                Serial.print("SW");
-                Serial.print(i);
-                first = false;
-            }
-        }
-        if (first) Serial.print("NONE");
-        Serial.println(")");
-
-        last_limit_stable_state = current_limit_state;
-    }
-
-    // COMPOSE RELAY MASK: Start with 0xFFFF (all relays off)
-    // AND with each active switch's mask to engage its relays
-    // If multiple switches hit, AND them all together to engage all needed brakes
-    
-    // Return 1 if ANY limit switch is active
-return (current_limit_state != 0);
+    return last_estop_stable_state ;
 
 }
 
@@ -364,84 +316,82 @@ return (current_limit_state != 0);
 // Used to set relay states
 
 ModbusMessage FC06(ModbusMessage request) {
-    uint16_t address, value;
+    uint16_t address, mask;
     ModbusMessage response;
 
     request.get(2, address);
-    request.get(4, value);
+    request.get(4, mask);
 
-    if (address == 0) {
-        modbus_relay_value = value;   // direct relay mask
-        response = request;           // echo back
-    } else {
-        response.setError(
-            request.getServerID(),
-            request.getFunctionCode(),
-            ILLEGAL_DATA_ADDRESS
-        );
+    if (address != REG_ADDR) {
+        response.setError(request.getServerID(),
+                          request.getFunctionCode(),
+                          ILLEGAL_DATA_ADDRESS);
+        return response;
     }
+
+    uint16_t toggle_bits = ~mask & 0xFFFF;
+    modbus_value ^= toggle_bits;
+
+    response = request;
     return response;
 }
 
 
-//Gripper function 
-uint16_t apply_gripper(uint16_t relay_state)
-{
-    // get only gripper bit from modbus
-    uint16_t gripper_bit = modbus_relay_value & (~GRIPPER_RELAY);
-    
-    //clear gripper bit from relay state and then insert modbus gripper bit
-    relay_state = (relay_state & GRIPPER_RELAY) | gripper_bit;
-
-    return relay_state;
-}
-
-
-
-
 // SETUP
-void setup(){
-    Serial.begin(115200);
-    delay(5000);
+void setup(){ 
+    Serial.begin(115200); 
+    delay(5000); 
     
-
-    bool wire_success = Wire.begin(I2C_SDA, I2C_SCL);
-    if (wire_success){
-        Serial.println("Wire successfully initialized");}    
-    else {
-        Serial.println("Failed to initialize Wire");
-        while (true){delay(100);}
-    }
+    bool wire_success = Wire.begin(I2C_SDA, I2C_SCL); 
+    if (wire_success){ 
+        Serial.println("Wire successfully initialized");} 
+    else { 
+        Serial.println("Failed to initialize Wire"); 
+        while (true){delay(100);} 
+    } 
     
-    // Pymodbus RTU over HardwareSerial2
+    // Pymodbus RTU over HardwareSerial2 
+    RTUutils::prepareHardwareSerial(Serial2); 
+    Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2); 
+    mb.registerWorker(1, WRITE_HOLD_REGISTER, &FC06); 
+    mb.begin(Serial2); pinMode(RTS, OUTPUT); 
+    
+    Serial.println("Modbus ready, waiting..."); 
+    
+    // Configure E-Stop pin and attach interrupt 
+    pinMode(ESTOP_PIN, INPUT_PULLUP); 
+    delay(50); 
+    // Force initial E-Stop state manually 
+    if (digitalRead(ESTOP_PIN) == LOW) { 
+        estop_stable_state = true; // pressed 
+        last_estop_stable_state = true; } 
+    else { estop_stable_state = false; // released 
+        last_estop_stable_state = false; } 
+        
 
-    RTUutils::prepareHardwareSerial(Serial2);
-    Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
-  
-    mb.registerWorker(1, WRITE_HOLD_REGISTER, &FC06);
-    mb.begin(Serial2);
+    attachInterrupt(digitalPinToInterrupt(ESTOP_PIN), estop_isr, CHANGE); 
+    pinMode(STATUS_LED, OUTPUT); 
+    Serial.println("E-Stop configured"); 
 
-
-
-    // Configure E-Stop pin and attach interrupt
-    pinMode(ESTOP_PIN, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(ESTOP_PIN), estop_isr, CHANGE);
-    pinMode(STATUS_LED, OUTPUT);
-    Serial.println("E-Stop configured");
-
-    // Configure all limit switches using array-based approach
-    for (uint8_t i = 0; i < NUM_LIMIT_SWITCHES; i++) {
-        pinMode(LIMIT_SWITCH_PINS[i], INPUT_PULLUP);
-        attachInterrupt(
-            digitalPinToInterrupt(LIMIT_SWITCH_PINS[i]),
-            LIMIT_SWITCH_ISR_HANDLERS[i],
-            CHANGE
-        );
-    }
-
-    Serial.print("Configured ");
-    Serial.print(NUM_LIMIT_SWITCHES);
-    Serial.println(" limit switches");
+    if (estop_stable_state) { // E-Stop pressed 
+        Serial.println("E-STOP PRESSED AT STARTUP — RELAYS OFF"); 
+        relay_state = 0xFFFF; } else { // E-Stop released 
+            relay_state = STARTUP_MASK; } 
+            
+    // Configure all limit switches using array-based approach 
+    for (uint8_t i = 0; i < NUM_LIMIT_SWITCHES; i++) { 
+        pinMode(LIMIT_SWITCH_PINS[i], INPUT_PULLUP); 
+        attachInterrupt( digitalPinToInterrupt(LIMIT_SWITCH_PINS[i]), 
+        LIMIT_SWITCH_ISR_HANDLERS[i], CHANGE ); } 
+        Serial.print("Configured "); 
+        Serial.print(NUM_LIMIT_SWITCHES); 
+        Serial.println(" limit switches"); 
+        Serial.println("Initial limit bitmap: ");
+        Serial.println(limit_stable_state, BIN); 
+        
+    // Create E-Stop debounce task // Runs on Core 0 with priority 2 (higher than main loop priority 1) 
+    Serial.println("Initial limit bitmap: ");
+    Serial.println(limit_stable_state, BIN);
 
     // Create E-Stop debounce task
     // Runs on Core 0 with priority 2 (higher than main loop priority 1)
@@ -490,24 +440,40 @@ void setup(){
     }
 
     Serial.println("All debounce tasks created on Core 0");
-    Serial.println("\\nTesting relay board...");
-    Serial.println("Engaging all brakes (0xFFFF)");
 
-    pcf8575_writeAll(0xFFFF);
-    delay(1000);
+    // Decide initial relay state from E-STOP
+    if (estop_stable_state) {
+        relay_state = 0xFFFF;
+    }        // E-STOP pressed → all relays OFF 
+    else {
+        relay_state = STARTUP_MASK;  // E-STOP released → normal startup
+    }
 
 
-
-    Serial.println("Relay test complete \n");
-    Serial.println("Ready");
+    // After E-Stop released → normal startup 
+    modbus_value = relay_state; 
+    last_relay_state = relay_state; 
     
+    //relay_state = STARTUP_MASK; 
+    //modbus_value = STARTUP_MASK; 
+    pcf8575_writeAll(relay_state);
+
+    /* ---------- WATCHDOG ---------- */ 
+    esp_task_wdt_init(2, true); 
+    esp_task_wdt_add(NULL); 
+
+    Serial.println("Relay init complete"); 
+    Serial.println("System READY"); 
+
+
+
+
 }
 
 void loop() {
     // Get relay states from safety monitoring functions
     // 0xFFFF = all relays OFF (safe, no faults)
     // Specific mask = engage relays for that fault (bits=0 where engaged)
-    
 
     // Compose with AND (active-low: engage if EITHER has 0 bits)
     // If E-Stop pressed: estop_relays has multiple 0 bits → engages those relays
@@ -516,43 +482,45 @@ void loop() {
     
     // Highest-priority safety decision
    bool estop = check_estop_state();
-   uint16_t relay_state;
 
     if (estop) {
-    relay_state = 0xFFFF;          // stop motion
-    }
-
-   else {
-    // Start from Modbus (base state)
-    relay_state = modbus_relay_value ;//& ALL_DRIVERS_MASK & ALL_BRAKES_MASK;
+            relay_state = 0xFFFF;   // E-stop highest priority
+        }
+    
+    else{
+    // Start from Modbus (base command)
+            relay_state = modbus_value;
+        
 
     taskENTER_CRITICAL(&limit_state_spinlock);
 
-    if (limit_stable_state & (1 << 0)) {
-        relay_state &= ALL_DRIVERS_MASK;   // force OFF
-        relay_state &= J0_BRAKE_RELAY;
-    }
-    if (limit_stable_state & (1 << 1)) {
-        relay_state &= ALL_DRIVERS_MASK;
-        relay_state &= J1_BRAKE_RELAY;
-    }
-    if (limit_stable_state & (1 << 2)) {
-        relay_state &= ALL_DRIVERS_MASK;
-        relay_state &= J2_BRAKE_RELAY;
-    }
+    if (digitalRead(LIMIT_J0_PIN) == LOW)  {
+            relay_state |= (~J0_DRIVER_RELAY & 0xFFFF);
+            relay_state |= (~J0_BRAKE_RELAY  & 0xFFFF);
+        }
+
+    if (digitalRead(LIMIT_J1_PIN) == LOW)  {
+            relay_state |= (~J1_DRIVER_RELAY & 0xFFFF);
+            relay_state |= (~J1_BRAKE_RELAY  & 0xFFFF);
+        }
+
+    if (digitalRead(LIMIT_J2_PIN) == LOW)  {
+            relay_state |= (~J2_DRIVER_RELAY & 0xFFFF);
+            relay_state |= (~J2_BRAKE_RELAY  & 0xFFFF);
+        }
 
     taskEXIT_CRITICAL(&limit_state_spinlock);
-}
+    }
+
+  
 
     //gripper priority
-    relay_state = apply_gripper(relay_state);
-
+    uint16_t gripper_bit = modbus_value & (~GRIPPER_RELAY);
+    relay_state = (relay_state & GRIPPER_RELAY) | gripper_bit;
 
     // Execute only if changed (edge detection prevents relay chatter)
     if (relay_state != last_relay_state) {
        
-
-
         Serial.print("Relay change: 0x");
         Serial.print(last_relay_state, HEX);
         Serial.print(" -> 0x");
@@ -568,7 +536,9 @@ void loop() {
     // Example: relay_state &= check_current_sensors();
     // Example: relay_state &= check_rs485_faults();
 
+    esp_task_wdt_reset();
+
     // Maintain 10kHz loop rate for fast response
-    delayMicroseconds(100);
+    delay(1);
 }
 
